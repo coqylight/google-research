@@ -57,16 +57,22 @@ from __future__ import print_function
 
 import functools
 import os
+from typing import Iterable, Optional, Sequence, Tuple, Union
 
 from absl import flags
 from absl import logging
-import cnn
-import lr
 import rnn
-import tensorflow as tf
-from tensorflow import estimator as tf_estimator
-import train_utils
-from ..util import dataset_utils
+
+tf = None
+tf_estimator = None
+cnn = None
+lr = None
+train_utils = None
+dataset_utils = None
+
+import torch
+from torch import nn
+from torch.utils import data as torch_data
 
 
 FLAGS = flags.FLAGS
@@ -156,6 +162,67 @@ _DEFAULT_HPARAMS_LOGISTIC = {
 }
 
 
+DatasetLike = Union[torch_data.Dataset, torch_data.DataLoader, Sequence]
+
+
+def _ensure_tensorflow():
+  """Lazily imports TensorFlow dependencies."""
+  global tf  # pylint: disable=global-variable-undefined
+  global tf_estimator  # pylint: disable=global-variable-undefined
+  if tf is None or tf_estimator is None:
+    try:
+      import tensorflow as tf_module  # pylint: disable=g-import-not-at-top
+      from tensorflow import estimator as tf_estimator_module  # pylint: disable=g-import-not-at-top
+    except Exception as exc:  # pylint: disable=broad-except
+      raise ImportError('TensorFlow dependencies are unavailable.') from exc
+    tf = tf_module
+    tf_estimator = tf_estimator_module
+
+
+def _ensure_cnn():
+  """Lazily imports the CNN training module."""
+  global cnn  # pylint: disable=global-variable-undefined
+  if cnn is None:
+    try:
+      from . import cnn as cnn_module  # pylint: disable=g-import-not-at-top
+    except Exception as exc:  # pylint: disable=broad-except
+      raise ImportError('CNN model dependencies are unavailable.') from exc
+    cnn = cnn_module
+
+
+def _ensure_lr():
+  """Lazily imports the logistic regression module."""
+  global lr  # pylint: disable=global-variable-undefined
+  if lr is None:
+    try:
+      from . import lr as lr_module  # pylint: disable=g-import-not-at-top
+    except Exception as exc:  # pylint: disable=broad-except
+      raise ImportError('Logistic regression model dependencies are unavailable.') from exc
+    lr = lr_module
+
+
+def _ensure_train_utils():
+  """Lazily imports TensorFlow training utilities."""
+  global train_utils  # pylint: disable=global-variable-undefined
+  if train_utils is None:
+    try:
+      from . import train_utils as train_utils_module  # pylint: disable=g-import-not-at-top
+    except Exception as exc:  # pylint: disable=broad-except
+      raise ImportError('TensorFlow training utilities are unavailable.') from exc
+    train_utils = train_utils_module
+
+
+def _ensure_dataset_utils():
+  """Lazily imports dataset utilities."""
+  global dataset_utils  # pylint: disable=global-variable-undefined
+  if dataset_utils is None:
+    try:
+      from ..util import dataset_utils as dataset_utils_module  # pylint: disable=g-import-not-at-top
+    except Exception as exc:  # pylint: disable=broad-except
+      raise ImportError('Dataset utilities are unavailable.') from exc
+    dataset_utils = dataset_utils_module
+
+
 def train_model(
     model_fn,
     train_input_fn,
@@ -169,6 +236,9 @@ def train_model(
     validation_input_fn: (fn) A tf.Estimator input_fn for the validation data.
     params: (dict) Model hyperparameters.
   """
+  _ensure_tensorflow()
+  _ensure_train_utils()
+
   run_config = tf_estimator.RunConfig(
       model_dir=FLAGS.model_dir,
       save_checkpoints_steps=FLAGS.train_steps_per_eval,
@@ -204,7 +274,239 @@ def train_model(
           precision_early_stopper.early_stop_predicate_fn))
 
 
+def _extract_example_components(example):
+  """Normalizes raw dataset examples to (sequence, length, label)."""
+  length = None
+  if isinstance(example, dict):
+    sequence = example.get('sequence')
+    length = example.get('sequence_length')
+    label = example.get('label')
+    if label is None:
+      label = example.get('is_viable')
+    if label is None and 'labels' in example:
+      label = example['labels']
+  else:
+    if isinstance(example, tuple) or isinstance(example, list):
+      if len(example) == 3:
+        sequence, length, label = example
+      elif len(example) == 2:
+        sequence, label = example
+      else:
+        raise ValueError('Unsupported example structure: %r' % (example,))
+    else:
+      raise TypeError('Unsupported example type: %s' % type(example))
+
+  if sequence is None or label is None:
+    raise ValueError('Dataset example must provide sequence and label fields.')
+
+  sequence_tensor = torch.as_tensor(sequence)
+  if sequence_tensor.dim() == 1:
+    sequence_tensor = sequence_tensor.unsqueeze(-1)
+  sequence_tensor = sequence_tensor.to(dtype=torch.float32)
+
+  if length is None:
+    length_value = int(sequence_tensor.shape[0])
+  else:
+    length_value = int(torch.as_tensor(length).item())
+
+  label_value = int(torch.as_tensor(label).item())
+
+  return sequence_tensor, length_value, label_value
+
+
+def collate_rnn_batch(batch, padding_value=0.0):
+  """Pads a batch of variable length sequences for PyTorch training."""
+  if not batch:
+    raise ValueError('Batches must contain at least one example.')
+
+  sequences = []
+  lengths = []
+  labels = []
+
+  for example in batch:
+    sequence_tensor, length_value, label_value = _extract_example_components(
+        example)
+    sequences.append(sequence_tensor)
+    lengths.append(max(length_value, 0))
+    labels.append(label_value)
+
+  max_length = max(lengths) if lengths else 0
+  feature_dim = sequences[0].shape[-1]
+
+  padded = torch.full(
+      (len(sequences), max_length, feature_dim),
+      fill_value=padding_value,
+      dtype=torch.float32)
+  mask = torch.zeros((len(sequences), max_length), dtype=torch.bool)
+
+  for i, (sequence_tensor, length_value) in enumerate(zip(sequences, lengths)):
+    if length_value == 0:
+      continue
+    padded[i, :length_value] = sequence_tensor[:length_value]
+    mask[i, :length_value] = True
+
+  batch_dict = {
+      'sequences': padded,
+      'lengths': torch.tensor(lengths, dtype=torch.long),
+      'mask': mask,
+      'labels': torch.tensor(labels, dtype=torch.long),
+  }
+  return batch_dict
+
+
+def _ensure_dataloader(
+    data: Optional[Union[DatasetLike, Iterable]],
+    batch_size: int,
+    shuffle: bool,
+    collate_fn) -> Optional[torch_data.DataLoader]:
+  """Creates a DataLoader if one was not provided."""
+  if data is None:
+    return None
+
+  if isinstance(data, torch_data.DataLoader):
+    return data
+
+  dataset_obj = data
+  if isinstance(data, Iterable) and not isinstance(
+      data, (torch_data.Dataset, Sequence)):
+    dataset_obj = list(data)
+
+  return torch_data.DataLoader(
+      dataset_obj,
+      batch_size=batch_size,
+      shuffle=shuffle,
+      collate_fn=collate_fn)
+
+
+def _infer_input_dim(loader: torch_data.DataLoader) -> int:
+  """Infers the feature dimension from the first batch in the loader."""
+  iterator = iter(loader)
+  try:
+    sample_batch = next(iterator)
+  except StopIteration as exc:
+    raise ValueError('Training data is empty.') from exc
+
+  sequences = sample_batch['sequences']
+  if sequences.dim() != 3:
+    raise ValueError(
+        'Expected padded sequences with rank 3, received shape %r.' %
+        (tuple(sequences.shape),))
+
+  return sequences.shape[-1]
+
+
+def _run_epoch(
+    model: rnn.RnnClassifier,
+    loader: torch_data.DataLoader,
+    device: torch.device,
+    optimizer: Optional[torch.optim.Optimizer],
+    criterion: nn.Module) -> Tuple[float, float]:
+  """Runs a single train or evaluation epoch."""
+  is_training = optimizer is not None
+  if is_training:
+    model.train()
+  else:
+    model.eval()
+
+  total_loss = 0.0
+  total_correct = 0
+  total_examples = 0
+
+  for batch in loader:
+    sequences = batch['sequences'].to(device)
+    lengths = batch['lengths'].to(device)
+    labels = batch['labels'].to(device)
+    mask = batch.get('mask')
+    if mask is not None:
+      mask = mask.to(device)
+
+    if is_training:
+      optimizer.zero_grad()
+      logits = model(sequences, lengths, mask=mask)
+      loss = criterion(logits, labels)
+      loss.backward()
+      optimizer.step()
+    else:
+      with torch.no_grad():
+        logits = model(sequences, lengths, mask=mask)
+        loss = criterion(logits, labels)
+
+    total_loss += loss.item() * labels.size(0)
+    predictions = logits.argmax(dim=1)
+    total_correct += (predictions == labels).sum().item()
+    total_examples += labels.size(0)
+
+  avg_loss = total_loss / total_examples if total_examples else 0.0
+  accuracy = total_correct / total_examples if total_examples else 0.0
+
+  return avg_loss, accuracy
+
+
+def train_rnn_classifier(
+    params,
+    train_data: Union[DatasetLike, Iterable],
+    validation_data: Optional[Union[DatasetLike, Iterable]] = None,
+    num_epochs: Optional[int] = None,
+    device: Optional[torch.device] = None,
+    collate_fn=collate_rnn_batch):
+  """Trains the PyTorch RNN classifier using RMSProp."""
+
+  if num_epochs is None:
+    num_epochs = params.get('num_epochs', 1)
+
+  batch_size = params['batch_size']
+  train_loader = _ensure_dataloader(train_data, batch_size, True, collate_fn)
+  if train_loader is None:
+    raise ValueError('Training data must be provided.')
+
+  validation_loader = _ensure_dataloader(
+      validation_data, batch_size, False, collate_fn)
+
+  input_dim = params.get('input_size') or params.get('residue_encoding_size')
+  if input_dim is None:
+    input_dim = _infer_input_dim(train_loader)
+
+  model = rnn.RnnClassifier(
+      input_size=input_dim,
+      hidden_size=params['num_units'],
+      num_layers=params['num_layers'],
+      num_classes=params['num_classes'],
+      dropout=params.get('dropout', 0.0))
+
+  device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+  model.to(device)
+
+  optimizer = torch.optim.RMSprop(
+      model.parameters(), lr=params['learning_rate'])
+  criterion = nn.CrossEntropyLoss()
+
+  history = {
+      'train_loss': [],
+      'train_accuracy': [],
+  }
+  if validation_loader is not None:
+    history['val_loss'] = []
+    history['val_accuracy'] = []
+
+  for _ in range(num_epochs):
+    train_loss, train_accuracy = _run_epoch(
+        model, train_loader, device, optimizer, criterion)
+    history['train_loss'].append(train_loss)
+    history['train_accuracy'].append(train_accuracy)
+
+    if validation_loader is not None:
+      val_loss, val_accuracy = _run_epoch(
+          model, validation_loader, device, None, criterion)
+      history['val_loss'].append(val_loss)
+      history['val_accuracy'].append(val_accuracy)
+
+  return model, history
+
+
 def main(_):
+  _ensure_tensorflow()
+  _ensure_dataset_utils()
+
   seq_encoder = None
   seq_encoder_fn = None
   if FLAGS.seq_encoder == 'varlen-id':
@@ -225,6 +527,7 @@ def main(_):
   default_hparams = None
   model_fn = None
   if FLAGS.model == 'cnn':
+    _ensure_cnn()
     default_hparams = _DEFAULT_HPARAMS_CNN
     model_fn = functools.partial(cnn.cnn_model_fn, refs=None)
     default_hparams['residue_encoding_size'] = seq_encoder.encoding_size
@@ -233,6 +536,7 @@ def main(_):
     default_hparams = _DEFAULT_HPARAMS_RNN
     model_fn = rnn.rnn_model_fn
   elif FLAGS.model == 'logistic':
+    _ensure_lr()
     default_hparams = _DEFAULT_HPARAMS_LOGISTIC
     model_fn = lr.logistic_regression_model_fn
     default_hparams['residue_encoding_size'] = seq_encoder.encoding_size
