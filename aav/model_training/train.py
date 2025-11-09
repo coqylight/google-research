@@ -55,17 +55,21 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import functools
+import collections
 import os
 
 from absl import flags
 from absl import logging
-import cnn
+import cnn_torch
 import lr
 import rnn
 import tensorflow as tf
 from tensorflow import estimator as tf_estimator
 import train_utils
+import numpy
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 from ..util import dataset_utils
 
 
@@ -156,6 +160,208 @@ _DEFAULT_HPARAMS_LOGISTIC = {
 }
 
 
+class _MetricAccumulator(object):
+  """Accumulates metrics weighted by batch size."""
+
+  def __init__(self):
+    self._totals = collections.defaultdict(float)
+    self._count = 0
+    self._updated_in_step = False
+
+  def update(self, metrics):
+    batch_size = int(metrics.get('batch_size', 1))
+    self._count += batch_size
+    for key, value in metrics.items():
+      if key == 'batch_size':
+        continue
+      self._totals[key] += float(value) * batch_size
+    self._updated_in_step = True
+
+  def consume_pending_update(self):
+    was_updated = self._updated_in_step
+    self._updated_in_step = False
+    return was_updated
+
+  def compute(self):
+    if not self._totals:
+      return {}
+    if self._count <= 0:
+      return {key: 0.0 for key in self._totals}
+    return {key: total / self._count for key, total in self._totals.items()}
+
+  def reset(self):
+    self._totals = collections.defaultdict(float)
+    self._count = 0
+    self._updated_in_step = False
+
+
+def _load_dataset_tensors(file_path, seq_encoder_fn, batch_size):
+  """Loads a TFRecord dataset into NumPy arrays."""
+  sequences = []
+  labels = []
+  with tf.Graph().as_default():
+    dataset = dataset_utils.read_tfrecord_dataset([file_path]).map(seq_encoder_fn)
+    dataset = dataset.batch(batch_size)
+    iterator = dataset.make_one_shot_iterator()
+    next_features, next_labels = iterator.get_next()
+    with tf.Session() as sess:
+      while True:
+        try:
+          features_batch, labels_batch = sess.run([next_features, next_labels])
+        except tf.errors.OutOfRangeError:
+          break
+        sequences.append(features_batch['sequence'])
+        labels.append(labels_batch)
+
+  if not sequences:
+    raise ValueError('No examples found in dataset: %s' % file_path)
+
+  features_np = numpy.concatenate(sequences, axis=0).astype(numpy.float32, copy=False)
+  labels_np = numpy.concatenate(labels, axis=0).astype(numpy.int64, copy=False)
+  return features_np, labels_np
+
+
+def _build_dataloader(features, labels, batch_size, shuffle, drop_last):
+  dataset = TensorDataset(
+      torch.from_numpy(features),
+      torch.from_numpy(labels))
+  return DataLoader(
+      dataset,
+      batch_size=batch_size,
+      shuffle=shuffle,
+      drop_last=drop_last)
+
+
+def _evaluate_model(model, data_loader, device, positive_class):
+  if data_loader is None:
+    return {}
+
+  model.eval()
+  accumulator = _MetricAccumulator()
+  loss_fn = nn.CrossEntropyLoss()
+  with torch.no_grad():
+    for features, labels in data_loader:
+      if device is not None:
+        features = features.to(device)
+        labels = labels.to(device)
+      logits = model(features)
+      loss = loss_fn(logits, labels)
+      metrics = cnn_torch.compute_classification_metrics(
+          logits,
+          labels,
+          positive_class)
+      metrics['loss'] = loss.item()
+      metrics['batch_size'] = int(labels.size(0))
+      accumulator.update(metrics)
+      accumulator.consume_pending_update()
+  model.train()
+  return accumulator.compute()
+
+
+def _generic_pytorch_training_loop(
+    model,
+    train_loader,
+    validation_loader,
+    step_fn,
+    train_accumulator,
+    max_steps,
+    eval_interval,
+    device,
+    positive_class):
+  if len(train_loader) == 0:
+    raise ValueError('Training dataset is empty.')
+
+  history = []
+  eval_interval = max(1, eval_interval)
+  steps = 0
+  train_accumulator.reset()
+  train_iterator = iter(train_loader)
+
+  while steps < max_steps:
+    try:
+      batch = next(train_iterator)
+    except StopIteration:
+      train_iterator = iter(train_loader)
+      batch = next(train_iterator)
+
+    metrics = step_fn(batch)
+    if not train_accumulator.consume_pending_update():
+      train_accumulator.update(metrics)
+      train_accumulator.consume_pending_update()
+
+    steps += 1
+    if (steps % eval_interval) == 0 or steps >= max_steps:
+      train_metrics = train_accumulator.compute()
+      validation_metrics = _evaluate_model(
+          model,
+          validation_loader,
+          device,
+          positive_class)
+      history.append({
+          'step': steps,
+          'train': train_metrics,
+          'validation': validation_metrics,
+      })
+      logging.info('Step %d training metrics: %s', steps, train_metrics)
+      logging.info('Step %d validation metrics: %s', steps, validation_metrics)
+      train_accumulator.reset()
+
+  return history
+
+
+def _train_cnn_with_pytorch(seq_encoder_fn, hparams):
+  params = dict(hparams.values())
+  batch_size = params.get('batch_size', _DEFAULT_HPARAMS_CNN['batch_size'])
+  learning_rate = params.get('learning_rate', _DEFAULT_HPARAMS_CNN['learning_rate'])
+
+  train_features, train_labels = _load_dataset_tensors(
+      FLAGS.train_path,
+      seq_encoder_fn,
+      batch_size)
+  validation_features, validation_labels = _load_dataset_tensors(
+      FLAGS.validation_path,
+      seq_encoder_fn,
+      batch_size)
+
+  train_loader = _build_dataloader(
+      train_features,
+      train_labels,
+      batch_size=batch_size,
+      shuffle=True,
+      drop_last=False)
+  validation_loader = _build_dataloader(
+      validation_features,
+      validation_labels,
+      batch_size=batch_size,
+      shuffle=False,
+      drop_last=False)
+
+  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+  logging.info('Training CNN model on device: %s', device)
+  model = cnn_torch.CnnClassifier(**params).to(device)
+
+  train_accumulator = _MetricAccumulator()
+  step_fn, optimizer = cnn_torch.make_training_step(
+      model,
+      learning_rate=learning_rate,
+      device=device,
+      positive_class=params.get('positive_class', model.positive_class),
+      metric_hooks=[train_accumulator.update])
+
+  history = _generic_pytorch_training_loop(
+      model,
+      train_loader,
+      validation_loader,
+      step_fn,
+      train_accumulator,
+      max_steps=FLAGS.max_train_steps,
+      eval_interval=FLAGS.train_steps_per_eval,
+      device=device,
+      positive_class=params.get('positive_class', model.positive_class))
+
+  return model, optimizer, history
+
+
 def train_model(
     model_fn,
     train_input_fn,
@@ -224,16 +430,17 @@ def main(_):
   # DEEEIRTTNPVATEQYGSVSTNLQRGNR
   default_hparams = None
   model_fn = None
+  use_pytorch = False
   if FLAGS.model == 'cnn':
-    default_hparams = _DEFAULT_HPARAMS_CNN
-    model_fn = functools.partial(cnn.cnn_model_fn, refs=None)
+    default_hparams = dict(_DEFAULT_HPARAMS_CNN)
     default_hparams['residue_encoding_size'] = seq_encoder.encoding_size
     default_hparams['seq_encoding_length'] = (len(FLAGS.ref_seq) + 1) * 2
+    use_pytorch = True
   elif FLAGS.model == 'rnn':
     default_hparams = _DEFAULT_HPARAMS_RNN
     model_fn = rnn.rnn_model_fn
   elif FLAGS.model == 'logistic':
-    default_hparams = _DEFAULT_HPARAMS_LOGISTIC
+    default_hparams = dict(_DEFAULT_HPARAMS_LOGISTIC)
     model_fn = lr.logistic_regression_model_fn
     default_hparams['residue_encoding_size'] = seq_encoder.encoding_size
     default_hparams['seq_encoding_length'] = (len(FLAGS.ref_seq) + 1) * 2
@@ -248,30 +455,35 @@ def main(_):
   hparams.add_param('model', FLAGS.model)
   hparams.add_param('seq_encoder', FLAGS.seq_encoder)
 
-  train_input_fn = dataset_utils.as_estimator_input_fn(
-      (dataset_utils.read_tfrecord_dataset(FLAGS.train_path)
-       .map(seq_encoder_fn)),
-      batch_size=hparams.batch_size,
-      sequence_element_encoding_shape=(
-          seq_encoder.encoding_size if FLAGS.model == 'rnn' else None),
-      drop_partial_batches=True,
-      num_epochs=None,
-      shuffle=True)
-  validation_input_fn = dataset_utils.as_estimator_input_fn(
-      (dataset_utils.read_tfrecord_dataset(FLAGS.validation_path)
-       .map(seq_encoder_fn)),
-      batch_size=hparams.batch_size,
-      sequence_element_encoding_shape=(
-          seq_encoder.encoding_size if FLAGS.model == 'rnn' else None),
-      drop_partial_batches=True,
-      num_epochs=1,
-      shuffle=False)
+  os.makedirs(FLAGS.model_dir, exist_ok=True)
 
-  train_model(
-      model_fn,
-      train_input_fn,
-      validation_input_fn,
-      hparams)
+  if use_pytorch:
+    _train_cnn_with_pytorch(seq_encoder_fn, hparams)
+  else:
+    train_input_fn = dataset_utils.as_estimator_input_fn(
+        (dataset_utils.read_tfrecord_dataset(FLAGS.train_path)
+         .map(seq_encoder_fn)),
+        batch_size=hparams.batch_size,
+        sequence_element_encoding_shape=(
+            seq_encoder.encoding_size if FLAGS.model == 'rnn' else None),
+        drop_partial_batches=True,
+        num_epochs=None,
+        shuffle=True)
+    validation_input_fn = dataset_utils.as_estimator_input_fn(
+        (dataset_utils.read_tfrecord_dataset(FLAGS.validation_path)
+         .map(seq_encoder_fn)),
+        batch_size=hparams.batch_size,
+        sequence_element_encoding_shape=(
+            seq_encoder.encoding_size if FLAGS.model == 'rnn' else None),
+        drop_partial_batches=True,
+        num_epochs=1,
+        shuffle=False)
+
+    train_model(
+        model_fn,
+        train_input_fn,
+        validation_input_fn,
+        hparams)
 
   with open(os.path.join(FLAGS.model_dir, 'hparams.json'), 'w') as f:
     f.write(hparams.to_json())
